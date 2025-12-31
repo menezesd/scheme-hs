@@ -17,6 +17,7 @@ import Data.Array (listArray, bounds, elems, (!), (//))
 import Data.Ratio (numerator, denominator, (%))
 import Data.Complex (Complex(..), mkPolar, realPart, imagPart, magnitude, phase)
 import Data.Char (toUpper, toLower, isAlpha, isDigit, isSpace, isUpper, isLower)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import System.IO
 import Control.Exception (try, IOException)
 
@@ -240,7 +241,11 @@ ioPrimitives =
     -- with-*-file operations (simplified - don't actually redirect)
     , ("with-input-from-file", withInputFromFile)
     , ("with-output-to-file", withOutputToFile)
-    -- Pair mutation
+    -- Mutable pair operations
+    , ("mcons", mcons)           -- Create a mutable pair
+    , ("mcar", mcar)             -- Get car of mutable pair
+    , ("mcdr", mcdr)             -- Get cdr of mutable pair
+    , ("mpair?", mpairQ)         -- Check if mutable pair
     , ("set-car!", setCar)
     , ("set-cdr!", setCdr)
     -- Environment procedures
@@ -1251,15 +1256,51 @@ vectorFill badArgs = throwError $ NumArgs 2 badArgs
 
 -- Pair mutation (returns new pair - true mutation requires mutable cells)
 
+-- | Create a mutable pair (cons cell that can be mutated with set-car!/set-cdr!)
+mcons :: [LispVal] -> IOThrowsError LispVal
+mcons [car', cdr'] = do
+    carRef <- liftIO $ newIORef car'
+    cdrRef <- liftIO $ newIORef cdr'
+    return $ MutablePair carRef cdrRef
+mcons badArgs = throwError $ NumArgs 2 badArgs
+
+-- | Get car of a mutable pair
+mcar :: [LispVal] -> IOThrowsError LispVal
+mcar [MutablePair carRef _] = liftIO $ readIORef carRef
+mcar [badArg] = throwError $ TypeMismatch "mutable-pair" badArg
+mcar badArgs = throwError $ NumArgs 1 badArgs
+
+-- | Get cdr of a mutable pair
+mcdr :: [LispVal] -> IOThrowsError LispVal
+mcdr [MutablePair _ cdrRef] = liftIO $ readIORef cdrRef
+mcdr [badArg] = throwError $ TypeMismatch "mutable-pair" badArg
+mcdr badArgs = throwError $ NumArgs 1 badArgs
+
+-- | Check if value is a mutable pair
+mpairQ :: [LispVal] -> IOThrowsError LispVal
+mpairQ [MutablePair _ _] = return $ Bool True
+mpairQ [_] = return $ Bool False
+mpairQ badArgs = throwError $ NumArgs 1 badArgs
+
+-- | set-car! - mutates the car of a mutable pair
+-- For immutable pairs, returns a new pair (non-R5RS but preserves backwards compat)
 setCar :: [LispVal] -> IOThrowsError LispVal
-setCar [List (_:xs), val] = return $ List (val:xs)
+setCar [MutablePair carRef _, val] = do
+    liftIO $ writeIORef carRef val
+    return Void  -- R5RS: set-car! returns unspecified value
+setCar [List (_:xs), val] = return $ List (val:xs)  -- Non-mutating fallback
 setCar [DottedList (_:xs) t, val] = return $ DottedList (val:xs) t
 setCar [List [], _] = throwError $ TypeMismatch "pair" (List [])
 setCar [badArg, _] = throwError $ TypeMismatch "pair" badArg
 setCar badArgs = throwError $ NumArgs 2 badArgs
 
+-- | set-cdr! - mutates the cdr of a mutable pair
+-- For immutable pairs, returns a new pair (non-R5RS but preserves backwards compat)
 setCdr :: [LispVal] -> IOThrowsError LispVal
-setCdr [List (x:_), List ys] = return $ List (x:ys)
+setCdr [MutablePair _ cdrRef, val] = do
+    liftIO $ writeIORef cdrRef val
+    return Void  -- R5RS: set-cdr! returns unspecified value
+setCdr [List (x:_), List ys] = return $ List (x:ys)  -- Non-mutating fallback
 setCdr [List (x:_), val] = return $ DottedList [x] val
 setCdr [DottedList (x:_) _, List ys] = return $ List (x:ys)
 setCdr [DottedList (x:_) _, val] = return $ DottedList [x] val

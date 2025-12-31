@@ -14,7 +14,22 @@ import Primitives (eqv)
 import Control.Monad (unless)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
+import Control.Exception (bracket, try, IOException)
 import Data.Maybe (isNothing)
+import System.IO (IOMode(..), openFile, hClose)
+
+-- | Tail call result - used for trampoline-based TCO
+data TailCall
+    = Done LispVal                                  -- Final result
+    | TailApply Env LispVal [LispVal]              -- Tail call to be trampolined
+
+-- | Trampoline loop - keeps evaluating tail calls until Done
+trampoline :: IOThrowsError TailCall -> IOThrowsError LispVal
+trampoline action = do
+    result <- action
+    case result of
+        Done val -> return val
+        TailApply env' func args -> trampoline (applyTail env' func args)
 
 -- | Evaluate a string and return string result
 evalString :: Env -> String -> IO String
@@ -227,6 +242,18 @@ eval env (List [Atom "load", String filename]) = do
     results <- mapM (eval env) exprs
     return $ last results
 
+-- call-with-input-file
+eval env (List [Atom "call-with-input-file", fileExpr, procExpr]) = do
+    String filename <- eval env fileExpr
+    proc <- eval env procExpr
+    callWithFile filename ReadMode env proc
+
+-- call-with-output-file
+eval env (List [Atom "call-with-output-file", fileExpr, procExpr]) = do
+    String filename <- eval env fileExpr
+    proc <- eval env procExpr
+    callWithFile filename WriteMode env proc
+
 -- Eval
 eval env (List [Atom "eval", expr]) = do
     evaluated <- eval env expr
@@ -255,22 +282,181 @@ eval env (List (func : args)) = do
 
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
--- | Apply a function to arguments
+-- | Apply a function to arguments (with trampoline for TCO)
 apply :: Env -> LispVal -> [LispVal] -> IOThrowsError LispVal
-apply _ (PrimitiveFunc func) args = liftThrows $ func args
-apply _ (IOFunc func) args = func args
-apply _ (Func params vararg body closure) args
+apply env func args = trampoline (applyTail env func args)
+
+-- | Internal apply that returns TailCall for trampoline
+applyTail :: Env -> LispVal -> [LispVal] -> IOThrowsError TailCall
+applyTail _ (PrimitiveFunc func) args = Done <$> liftThrows (func args)
+applyTail _ (IOFunc func) args = Done <$> func args
+applyTail _ (Cont (Continuation k)) [arg] = Done <$> k arg
+applyTail _ (Cont _) args = throwError $ NumArgs 1 args
+applyTail _ (Func params vararg body closure) args
     | length params /= length args && isNothing vararg =
         throwError $ NumArgs (toInteger $ length params) args
     | otherwise = do
         let remainingArgs = drop (length params) args
-        bindings <- return $ zip params args
+        let bindings = zip params args
         let varargBinding = case vararg of
                 Nothing  -> []
                 Just arg -> [(arg, List remainingArgs)]
         newEnv <- liftIO $ extendEnv closure (bindings ++ varargBinding)
-        evalBody newEnv body
-apply _ notFunc _ = throwError $ NotFunction "Not a function" (show notFunc)
+        evalBodyTail newEnv body
+applyTail _ notFunc _ = throwError $ NotFunction "Not a function" (show notFunc)
+
+-- | Evaluate body with tail call support (last expr is tail position)
+evalBodyTail :: Env -> [LispVal] -> IOThrowsError TailCall
+evalBodyTail _ [] = return $ Done Void
+evalBodyTail env [expr] = evalTail env expr
+evalBodyTail env (expr : rest) = eval env expr >> evalBodyTail env rest
+
+-- | Evaluate an expression in tail position
+evalTail :: Env -> LispVal -> IOThrowsError TailCall
+-- Self-evaluating forms
+evalTail _ val@(Number _)  = return $ Done val
+evalTail _ val@(String _)  = return $ Done val
+evalTail _ val@(Char _)    = return $ Done val
+evalTail _ val@(Bool _)    = return $ Done val
+evalTail _ val@(Vector _)  = return $ Done val
+evalTail _ Void            = return $ Done Void
+
+-- Variable reference
+evalTail env (Atom var) = Done <$> getVar env var
+
+-- Quote
+evalTail _ (List [Atom "quote", val]) = return $ Done val
+
+-- If in tail position
+evalTail env (List [Atom "if", pred', conseq, alt]) = do
+    result <- eval env pred'
+    case result of
+        Bool False -> evalTail env alt
+        _          -> evalTail env conseq
+
+evalTail env (List [Atom "if", pred', conseq]) = do
+    result <- eval env pred'
+    case result of
+        Bool False -> return $ Done Void
+        _          -> evalTail env conseq
+
+-- Begin in tail position
+evalTail env (List (Atom "begin" : exprs)) = evalBodyTail env exprs
+
+-- Cond in tail position
+evalTail env (List (Atom "cond" : clauses)) = evalCondTail env clauses
+
+-- Case in tail position
+evalTail env (List (Atom "case" : key : clauses)) = do
+    keyVal <- eval env key
+    evalCaseTail env keyVal clauses
+
+-- And in tail position
+evalTail env (List (Atom "and" : args)) = evalAndTail env args
+
+-- Or in tail position
+evalTail env (List (Atom "or" : args)) = evalOrTail env args
+
+-- Let in tail position
+evalTail env (List (Atom "let" : List bindings : body)) = do
+    bindingPairs <- mapM (extractBinding env) bindings
+    newEnv <- liftIO $ extendEnv env bindingPairs
+    evalBodyTail newEnv body
+
+-- Named let in tail position
+evalTail env (List (Atom "let" : Atom name : List bindings : body)) = do
+    bindingPairs <- mapM (extractBinding env) bindings
+    let paramNames = map fst bindingPairs
+    newEnv <- liftIO $ extendEnv env ((name, Void) : bindingPairs)
+    let func = Func paramNames Nothing body newEnv
+    _ <- setVar newEnv name func
+    evalBodyTail newEnv body
+
+-- Let* in tail position
+evalTail env (List (Atom "let*" : List bindings : body)) = do
+    newEnv <- evalLetStar env bindings
+    evalBodyTail newEnv body
+
+-- Letrec in tail position
+evalTail env (List (Atom "letrec" : List bindings : body)) = do
+    let names = map extractName bindings
+    newEnv <- liftIO $ extendEnv env (map (\n -> (n, Void)) names)
+    mapM_ (evalLetrecBinding newEnv) bindings
+    evalBodyTail newEnv body
+  where
+    extractName (List [Atom n, _]) = n
+    extractName _ = ""
+
+-- Function application in tail position
+evalTail env (List (func : args)) = do
+    f <- eval env func
+    case f of
+        Syntax rules -> do
+            expanded <- expandSyntax rules (List (func : args))
+            evalTail env expanded
+        Macro mParams mVararg mBody -> do
+            expanded <- expandMacro mParams mVararg mBody args
+            evalTail env expanded
+        _ -> do
+            evaledArgs <- mapM (eval env) args
+            return $ TailApply env f evaledArgs
+
+-- Default: delegate to regular eval
+evalTail env expr = Done <$> eval env expr
+
+-- | Tail-recursive cond evaluation
+evalCondTail :: Env -> [LispVal] -> IOThrowsError TailCall
+evalCondTail _ [] = return $ Done Void
+evalCondTail env [List (Atom "else" : exprs)] = evalBodyTail env exprs
+evalCondTail env (List [test, Atom "=>", expr] : rest) = do
+    result <- eval env test
+    case result of
+        Bool False -> evalCondTail env rest
+        _          -> do
+            func <- eval env expr
+            return $ TailApply env func [result]
+evalCondTail env (List (test : exprs) : rest) = do
+    result <- eval env test
+    case result of
+        Bool False -> evalCondTail env rest
+        _          -> if null exprs
+                        then return $ Done result
+                        else evalBodyTail env exprs
+evalCondTail _ (badClause : _) = throwError $ BadSpecialForm "Invalid cond clause" badClause
+
+-- | Tail-recursive case evaluation
+evalCaseTail :: Env -> LispVal -> [LispVal] -> IOThrowsError TailCall
+evalCaseTail _ _ [] = return $ Done Void
+evalCaseTail env _ [List (Atom "else" : exprs)] = evalBodyTail env exprs
+evalCaseTail env keyVal (List (List datums : exprs) : rest) = do
+    matches <- mapM (\d -> liftThrows $ eqv [keyVal, d]) datums
+    if any isBoolTrue matches
+        then evalBodyTail env exprs
+        else evalCaseTail env keyVal rest
+  where
+    isBoolTrue (Bool True) = True
+    isBoolTrue _           = False
+evalCaseTail _ _ (badClause : _) = throwError $ BadSpecialForm "Invalid case clause" badClause
+
+-- | Tail-recursive and evaluation
+evalAndTail :: Env -> [LispVal] -> IOThrowsError TailCall
+evalAndTail _ [] = return $ Done $ Bool True
+evalAndTail env [x] = evalTail env x
+evalAndTail env (x : xs) = do
+    result <- eval env x
+    case result of
+        Bool False -> return $ Done $ Bool False
+        _          -> evalAndTail env xs
+
+-- | Tail-recursive or evaluation
+evalOrTail :: Env -> [LispVal] -> IOThrowsError TailCall
+evalOrTail _ [] = return $ Done $ Bool False
+evalOrTail env [x] = evalTail env x
+evalOrTail env (x : xs) = do
+    result <- eval env x
+    case result of
+        Bool False -> evalOrTail env xs
+        _          -> return $ Done result
 
 -- | Evaluate a body (sequence of expressions)
 evalBody :: Env -> [LispVal] -> IOThrowsError LispVal
@@ -544,14 +730,37 @@ expandMacro params vararg body args
         return $ substituteTemplate allBindings (List (Atom "begin" : body))
 
 -- | Implement call/cc using exception-based continuations
+-- Note: This implementation has limitations:
+-- - Continuations can only be called during the dynamic extent of call/cc
+-- - Multiple invocations work within that extent
+-- - Cannot serialize or persist continuations
 callCC :: Env -> LispVal -> IOThrowsError LispVal
 callCC env proc = do
-    -- Create a continuation that throws a ContinuationJump when called
-    let continuation = IOFunc $ \args -> case args of
-            [val] -> throwError $ ContinuationJump val
-            _     -> throwError $ NumArgs 1 args
+    -- Create a unique tag for this continuation
+    -- The continuation throws ContinuationJump when called
+    let continuation = Cont $ Continuation $ \val ->
+            throwError $ ContinuationJump val
     -- Apply the procedure to the continuation and catch any jumps
     catchError (apply env proc [continuation]) $ \err ->
         case err of
             ContinuationJump val -> return val
             _                    -> throwError err
+
+-- | Helper for call-with-input-file and call-with-output-file
+-- Opens file, calls proc with port, ensures file is closed even on error
+callWithFile :: String -> IOMode -> Env -> LispVal -> IOThrowsError LispVal
+callWithFile filename mode env proc = do
+    result <- liftIO $ try $ openFile filename mode
+    case result of
+        Left e -> throwError $ Default $ "Cannot open file: " ++ show (e :: IOException)
+        Right handle -> do
+            let port = Port handle
+            -- Use catchError to ensure cleanup on Scheme errors
+            catchError
+                (do
+                    val <- apply env proc [port]
+                    liftIO $ hClose handle
+                    return val)
+                (\err -> do
+                    liftIO $ hClose handle
+                    throwError err)

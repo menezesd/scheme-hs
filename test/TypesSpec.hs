@@ -216,3 +216,32 @@ spec = do
         it "schemeNumToDouble of integer matches fromIntegral" $ property $
             \(n :: Integer) ->
                 schemeNumToDouble (SInteger n) == fromIntegral n
+
+        it "promoteToComplex of integer has zero imaginary part" $ property $
+            \(n :: Integer) ->
+                imagPart (promoteToComplex (SInteger n)) == 0
+
+        it "SInteger equality is reflexive" $ property $
+            \(n :: Integer) ->
+                SInteger n == SInteger n
+
+        it "SReal equality is reflexive for non-NaN" $ property $
+            \(d :: Double) ->
+                not (isNaN d) ==> SReal d == SReal d
+
+        it "simplifyNum preserves value" $ property $
+            \(n :: SchemeNum) ->
+                let simplified = simplifyNum n
+                    originalDouble = schemeNumToDouble n
+                    simplifiedDouble = schemeNumToDouble simplified
+                in if isNaN originalDouble
+                   then isNaN simplifiedDouble
+                   else abs (originalDouble - simplifiedDouble) < 1e-10
+
+        it "isExact is false for SReal" $ property $
+            \(d :: Double) ->
+                not (isExact (SReal d))
+
+        it "isExact is true for SInteger" $ property $
+            \(n :: Integer) ->
+                isExact (SInteger n)

@@ -235,3 +235,40 @@ spec = do
                     in case result of
                         List elems -> length elems == n
                         _ -> n == 0  -- empty list case
+
+        it "nested quotes parse correctly" $ property $
+            \(Small (n :: Int)) ->
+                n >= 1 && n <= 10 ==>
+                    let input = replicate n '\'' ++ "x"
+                        result = parseOk input
+                    in isQuotedNTimes n result
+
+        it "string escapes roundtrip" $ property $
+            \(s :: String) ->
+                all validChar s ==>
+                    let escaped = concatMap escapeChar s
+                        input = "\"" ++ escaped ++ "\""
+                    in case readExpr input of
+                        Right (String s') -> s' == s
+                        _ -> False
+
+        it "booleans are self-inverse under not not" $ property $
+            \(b :: Bool) ->
+                parseOk (if b then "#t" else "#f") == Bool b
+
+-- Helper for nested quote test
+isQuotedNTimes :: Int -> LispVal -> Bool
+isQuotedNTimes 0 (Atom "x") = True
+isQuotedNTimes n (List [Atom "quote", inner]) = isQuotedNTimes (n - 1) inner
+isQuotedNTimes _ _ = False
+
+-- Helpers for string escape test
+validChar :: Char -> Bool
+validChar c = c /= '\0' && c /= '\r'
+
+escapeChar :: Char -> String
+escapeChar '"' = "\\\""
+escapeChar '\\' = "\\\\"
+escapeChar '\n' = "\\n"
+escapeChar '\t' = "\\t"
+escapeChar c = [c]

@@ -1,4 +1,5 @@
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Types
     ( LispVal(..)
@@ -18,15 +19,56 @@ module Types
     , promoteToComplex
     , simplifyNum
     , Continuation(..)
+    , SourceInfo(..)
+    , noSource
+    , showSourceInfo
+    , fromSourcePos
+    -- Error helpers
+    , throwNumArgs
+    , throwTypeMismatch
+    , throwNotFunction
+    , throwUnboundVar
+    , throwBadForm
     ) where
 
 import Control.Monad.Except
 import Data.IORef
-import Text.ParserCombinators.Parsec (ParseError)
+import Text.ParserCombinators.Parsec (ParseError, SourcePos, sourceLine, sourceColumn, sourceName)
 import Data.Array (Array)
-import Data.Ratio (Ratio, numerator, denominator, (%))
+import Data.Ratio (Ratio, numerator, denominator)
 import Data.Complex (Complex(..), realPart, imagPart)
+import Data.Map.Strict (Map)
 import System.IO (Handle)
+import System.IO.Unsafe (unsafePerformIO)
+
+-- | Source location information for error messages
+data SourceInfo = SourceInfo
+    { sourceFile :: String
+    , sourceLine' :: Int
+    , sourceCol  :: Int
+    } deriving (Eq)
+
+instance Show SourceInfo where
+    show = showSourceInfo
+
+-- | Create SourceInfo from Parsec's SourcePos
+fromSourcePos :: SourcePos -> SourceInfo
+fromSourcePos pos = SourceInfo
+    { sourceFile = sourceName pos
+    , sourceLine' = sourceLine pos
+    , sourceCol = sourceColumn pos
+    }
+
+-- | Placeholder for values without source info
+noSource :: SourceInfo
+noSource = SourceInfo "" 0 0
+
+-- | Display source info
+showSourceInfo :: SourceInfo -> String
+showSourceInfo si
+    | sourceFile si == "" && sourceLine' si == 0 = ""
+    | sourceFile si == "" = "line " ++ show (sourceLine' si) ++ ", column " ++ show (sourceCol si)
+    | otherwise = sourceFile si ++ ":" ++ show (sourceLine' si) ++ ":" ++ show (sourceCol si)
 
 -- | Scheme numeric tower
 -- Hierarchy: Integer < Rational < Real < Complex
@@ -102,8 +144,9 @@ newtype Continuation = Continuation (LispVal -> IOThrowsError LispVal)
 -- | The core Scheme value type
 data LispVal
     = Atom String                          -- Symbols/identifiers
-    | List [LispVal]                       -- Proper lists
+    | List [LispVal]                       -- Proper lists (immutable)
     | DottedList [LispVal] LispVal         -- Improper lists (a b . c)
+    | MutablePair (IORef LispVal) (IORef LispVal)  -- Mutable cons cell for set-car!/set-cdr!
     | Number SchemeNum                     -- Full numeric tower
     | String String                        -- Strings
     | Char Char                            -- Characters
@@ -151,6 +194,14 @@ showVal :: LispVal -> String
 showVal (Atom name)       = name
 showVal (List contents)   = "(" ++ unwordsList contents ++ ")"
 showVal (DottedList h t)  = "(" ++ unwordsList h ++ " . " ++ showVal t ++ ")"
+showVal (MutablePair carRef cdrRef) =
+    -- Use unsafePerformIO for display (safe here as it's read-only)
+    let car' = unsafePerformIO $ readIORef carRef
+        cdr' = unsafePerformIO $ readIORef cdrRef
+    in case cdr' of
+        List [] -> "(" ++ showVal car' ++ ")"
+        List xs -> "(" ++ showVal car' ++ " " ++ unwordsList xs ++ ")"
+        _       -> "(" ++ showVal car' ++ " . " ++ showVal cdr' ++ ")"
 showVal (Number n)        = show n
 showVal (String s)        = "\"" ++ escapeString s ++ "\""
 showVal (Char c)          = showChar' c
@@ -195,7 +246,7 @@ showChar' c    = "#\\" ++ [c]
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
 
--- | Error types
+-- | Error types with optional source location
 data LispError
     = NumArgs Integer [LispVal]
     | TypeMismatch String LispVal
@@ -206,9 +257,15 @@ data LispError
     | DivideByZero
     | OutOfRange String Integer
     | Default String
-    | ContinuationJump LispVal  -- Used for call/cc implementation
+    | ContinuationJump LispVal
+    | WithSource SourceInfo LispError  -- Wrapper for errors with source location
 
 showError :: LispError -> String
+showError (WithSource src err) =
+    let srcStr = showSourceInfo src
+    in if null srcStr
+        then showError err
+        else srcStr ++ ": " ++ showError err
 showError (NumArgs expected found) =
     "Expected " ++ show expected ++ " args; found values " ++ unwordsList found
 showError (TypeMismatch expected found) =
@@ -225,13 +282,29 @@ showError (ContinuationJump _) = "Continuation called outside of call/cc"
 instance Show LispError where
     show = showError
 
+-- | Error helper functions for cleaner error throwing
+throwNumArgs :: MonadError LispError m => Integer -> [LispVal] -> m a
+throwNumArgs n args = throwError $ NumArgs n args
+
+throwTypeMismatch :: MonadError LispError m => String -> LispVal -> m a
+throwTypeMismatch expected found = throwError $ TypeMismatch expected found
+
+throwNotFunction :: MonadError LispError m => String -> m a
+throwNotFunction name = throwError $ NotFunction "Not a function" name
+
+throwUnboundVar :: MonadError LispError m => String -> m a
+throwUnboundVar var = throwError $ UnboundVar "Unbound variable" var
+
+throwBadForm :: MonadError LispError m => String -> LispVal -> m a
+throwBadForm msg form = throwError $ BadSpecialForm msg form
+
 type ThrowsError = Either LispError
 
--- | Environment: mutable bindings
-type Env = IORef [(String, IORef LispVal)]
+-- | Environment: mutable bindings using Map for O(log n) lookup
+type Env = IORef (Map String (IORef LispVal))
 
 nullEnv :: IO Env
-nullEnv = newIORef []
+nullEnv = newIORef mempty
 
 type IOThrowsError = ExceptT LispError IO
 
