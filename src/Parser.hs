@@ -1,5 +1,33 @@
+-- | Scheme expression parser
+--
+-- This module provides parsers for R5RS Scheme syntax including:
+--
+-- == Supported Syntax
+--
+-- * __Atoms__: Symbols/identifiers (e.g., @foo@, @+@, @string->list@)
+-- * __Numbers__: Full numeric tower
+--     * Integers: @42@, @-17@, @#x1A@ (hex), @#o17@ (octal), @#b101@ (binary)
+--     * Rationals: @22/7@, @-1/3@
+--     * Reals: @3.14@, @1.0e-5@
+--     * Complex: @3+4i@, @1-2i@
+--     * Exactness: @#e3.0@ (exact), @#i42@ (inexact)
+-- * __Strings__: @\"hello world\"@ with escape sequences
+-- * __Characters__: @#\\a@, @#\\space@, @#\\newline@
+-- * __Booleans__: @#t@, @#f@
+-- * __Lists__: @(a b c)@, @(1 . 2)@ (dotted pair)
+-- * __Vectors__: @#(1 2 3)@
+-- * __Quotation__: @\'x@, @\`x@, @,x@, @,\@x@
+--
+-- == Usage
+--
+-- @
+-- case readExpr "(+ 1 2)" of
+--     Right expr -> eval env expr
+--     Left err   -> print err
+-- @
 module Parser
-    ( readExpr
+    ( -- * Parsing functions
+      readExpr
     , readExprList
     ) where
 

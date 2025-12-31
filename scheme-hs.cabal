@@ -2,17 +2,29 @@ cabal-version:      2.4
 name:               scheme-hs
 version:            0.1.0.0
 synopsis:           An R5RS Scheme interpreter in Haskell
+description:        A comprehensive R5RS Scheme interpreter implementing the full
+                    numeric tower, macros, continuations, and standard library.
 license:            MIT
 author:             Dean
 build-type:         Simple
 
+common warnings
+    ghc-options:      -Wall
+
 executable scheme-hs
+    import:           warnings
     main-is:          Main.hs
     other-modules:    Types
                     , Parser
                     , Env
                     , Eval
                     , Primitives
+                    , Primitives.Numeric
+                    , Primitives.String
+                    , Primitives.Char
+                    , Primitives.List
+                    , Primitives.Vector
+                    , Primitives.IO
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -20,19 +32,26 @@ executable scheme-hs
                     , array >= 0.5
     hs-source-dirs:   src
     default-language: Haskell2010
-    ghc-options:      -Wall
 
 test-suite scheme-hs-test
+    import:           warnings
     type:             exitcode-stdio-1.0
     main-is:          Main.hs
     other-modules:    ParserSpec
                     , TypesSpec
                     , IntegrationSpec
+                    , FuzzSpec
                     , Types
                     , Parser
                     , Env
                     , Eval
                     , Primitives
+                    , Primitives.Numeric
+                    , Primitives.String
+                    , Primitives.Char
+                    , Primitives.List
+                    , Primitives.Vector
+                    , Primitives.IO
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -42,4 +61,28 @@ test-suite scheme-hs-test
                     , QuickCheck >= 2.14
     hs-source-dirs:   test, src
     default-language: Haskell2010
-    ghc-options:      -Wall
+
+benchmark scheme-hs-bench
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    other-modules:    Types
+                    , Parser
+                    , Env
+                    , Eval
+                    , Primitives
+                    , Primitives.Numeric
+                    , Primitives.String
+                    , Primitives.Char
+                    , Primitives.List
+                    , Primitives.Vector
+                    , Primitives.IO
+    build-depends:    base >= 4.14 && < 5
+                    , parsec >= 3.1
+                    , mtl >= 2.2
+                    , containers >= 0.6
+                    , array >= 0.5
+                    , criterion >= 1.5
+                    , deepseq >= 1.4
+    hs-source-dirs:   bench, src
+    default-language: Haskell2010

@@ -237,11 +237,10 @@ spec = do
                         _ -> n == 0  -- empty list case
 
         it "nested quotes parse correctly" $ property $
-            \(Small (n :: Int)) ->
-                n >= 1 && n <= 10 ==>
-                    let input = replicate n '\'' ++ "x"
-                        result = parseOk input
-                    in isQuotedNTimes n result
+            forAll (choose (1, 10)) $ \n ->
+                let input = replicate n '\'' ++ "x"
+                    result = parseOk input
+                in isQuotedNTimes n result
 
         it "string escapes roundtrip" $ property $
             \(s :: String) ->

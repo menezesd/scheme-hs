@@ -1,6 +1,46 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 
+-- | Core types for the R5RS Scheme interpreter
+--
+-- This module defines the fundamental data types used throughout the interpreter:
+--
+-- == Scheme Values ('LispVal')
+--
+-- The 'LispVal' type represents all possible Scheme values including:
+--
+-- * Atoms (symbols/identifiers)
+-- * Lists (proper and improper)
+-- * Numbers (full numeric tower: integer, rational, real, complex)
+-- * Strings and characters
+-- * Booleans
+-- * Vectors
+-- * Procedures (primitive, I/O, and user-defined)
+-- * Ports (for I/O)
+-- * Continuations (for call/cc)
+-- * Macros (traditional and syntax-rules)
+--
+-- == Error Handling
+--
+-- The 'LispError' type captures all possible error conditions with optional
+-- source location information. The 'ThrowsError' and 'IOThrowsError' type
+-- aliases provide convenient error handling in pure and I/O contexts.
+--
+-- == Environment
+--
+-- The 'Env' type is a mutable environment mapping variable names to values,
+-- implemented using 'IORef' for efficient mutation.
+--
+-- == Numeric Tower
+--
+-- The 'SchemeNum' type implements the full R5RS numeric tower:
+--
+-- @
+-- Integer < Rational < Real < Complex
+-- @
+--
+-- Each level can be exact or inexact, with automatic promotion during
+-- arithmetic operations.
 module Types
     ( LispVal(..)
     , LispError(..)

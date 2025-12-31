@@ -1,7 +1,42 @@
 {-# LANGUAGE FlexibleContexts #-}
 
+-- | Scheme expression evaluator
+--
+-- This module implements the core evaluation logic for R5RS Scheme,
+-- including all special forms, function application, and macro expansion.
+--
+-- == Features
+--
+-- * __Tail Call Optimization__: Uses a trampoline-based approach to
+--   eliminate stack growth for tail-recursive calls
+-- * __First-class Continuations__: Supports @call/cc@ for non-local control flow
+-- * __Hygienic Macros__: Implements @syntax-rules@ pattern matching and expansion
+-- * __Full Numeric Tower__: Automatic numeric promotion during operations
+--
+-- == Special Forms
+--
+-- The evaluator handles these special forms:
+--
+-- * Binding: @define@, @set!@, @let@, @let*@, @letrec@
+-- * Control: @if@, @cond@, @case@, @and@, @or@, @begin@, @do@
+-- * Procedures: @lambda@, @apply@, @map@, @for-each@
+-- * Quotation: @quote@, @quasiquote@, @unquote@, @unquote-splicing@
+-- * Continuations: @call/cc@, @call-with-current-continuation@
+-- * Macros: @define-syntax@, @let-syntax@, @letrec-syntax@
+-- * I/O: @load@, @call-with-input-file@, @call-with-output-file@
+--
+-- == Evaluation Model
+--
+-- Evaluation uses a combination of direct recursion and trampolining:
+--
+-- 1. Non-tail expressions are evaluated directly via 'eval'
+-- 2. Tail-position expressions return 'TailCall' values
+-- 3. The 'trampoline' function iterates until a final 'Done' value
+--
+-- This ensures constant stack space for tail-recursive programs.
 module Eval
-    ( eval
+    ( -- * Main evaluation functions
+      eval
     , evalString
     , evalAndPrint
     , evalBody

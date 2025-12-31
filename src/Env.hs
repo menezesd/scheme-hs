@@ -1,8 +1,37 @@
+-- | Environment management for variable bindings
+--
+-- This module provides functions for manipulating the lexical environment,
+-- which maps variable names to their values. The environment is implemented
+-- as a mutable 'Data.Map.Strict.Map' wrapped in 'IORef' for efficient
+-- O(log n) lookup and update.
+--
+-- == Environment Operations
+--
+-- * 'getVar' / 'setVar': Access and modify existing bindings
+-- * 'defineVar': Create new bindings or update existing ones
+-- * 'bindVars' / 'extendEnv': Create new scope with additional bindings
+--
+-- == Lexical Scoping
+--
+-- Each function closure captures its defining environment, enabling
+-- proper lexical scoping. When a function is called, 'extendEnv' creates
+-- a new scope extending the closure's environment.
+--
+-- == Example
+--
+-- @
+-- env <- primitiveBindings
+-- defineVar env "x" (Number (SInteger 42))
+-- val <- getVar env "x"  -- Returns Number (SInteger 42)
+-- @
 module Env
-    ( isBound
+    ( -- * Environment predicates
+      isBound
+      -- * Variable access
     , getVar
     , setVar
     , defineVar
+      -- * Environment extension
     , bindVars
     , extendEnv
     ) where
