@@ -20,7 +20,9 @@ module VM
     , VMResult(..)
       -- * Execution
     , runVM
+    , runVMWithArgs
     , vmInit
+    , vmPushArg
       -- * Conversion
     , lispValToConst
     , constToLispVal
@@ -29,6 +31,7 @@ module VM
 import Types
 import Bytecode
 import Env (getVar, setVar, defineVar)
+import JIT (getCompiledCode)
 
 import Control.Monad (when, unless, replicateM)
 import Control.Monad.Except
@@ -43,7 +46,8 @@ import Data.Ratio (Ratio, (%), numerator, denominator)
 data VM = VM
     { vmStack  :: IORef (MV.IOVector LispVal)  -- Value stack
     , vmSP     :: IORef Int                     -- Stack pointer
-    , vmFrames :: IORef [VMFrame]               -- Call stack
+    , vmFrames :: IORef [VMFrame]               -- Call stack (return addresses)
+    , vmLocals :: IORef [IORef LispVal]         -- Current frame's locals
     , vmCode   :: IORef CodeObject              -- Current code
     , vmIP     :: IORef Int                     -- Instruction pointer
     , vmEnv    :: IORef Env                     -- Global environment
@@ -74,6 +78,7 @@ vmInit env = do
     stackRef <- newIORef stack
     spRef <- newIORef 0
     framesRef <- newIORef []
+    localsRef <- newIORef []
     codeRef <- newIORef emptyCodeObject
     ipRef <- newIORef 0
     envRef <- newIORef env
@@ -81,6 +86,7 @@ vmInit env = do
         { vmStack = stackRef
         , vmSP = spRef
         , vmFrames = framesRef
+        , vmLocals = localsRef
         , vmCode = codeRef
         , vmIP = ipRef
         , vmEnv = envRef
@@ -94,6 +100,22 @@ runVM vm code = do
     writeIORef (vmSP vm) 0
     writeIORef (vmFrames vm) []
     vmLoop vm
+
+-- | Run bytecode with arguments (for calling compiled functions)
+runVMWithArgs :: VM -> CodeObject -> [LispVal] -> IO VMResult
+runVMWithArgs vm code args = do
+    writeIORef (vmCode vm) code
+    writeIORef (vmIP vm) 0
+    writeIORef (vmSP vm) 0
+    writeIORef (vmFrames vm) []
+    -- Set current frame's locals to the arguments
+    locals <- mapM newIORef args
+    writeIORef (vmLocals vm) locals
+    vmLoop vm
+
+-- | Push an argument onto the VM stack (for setup)
+vmPushArg :: VM -> LispVal -> IO ()
+vmPushArg = vmPush
 
 -- | Main VM loop
 vmLoop :: VM -> IO VMResult
@@ -134,42 +156,46 @@ vmStep vm op = case op of
         return Nothing
 
     OP_LOOKUP depth offset -> do
-        frames <- readIORef (vmFrames vm)
-        if depth == 0 && not (null frames)
+        if depth == 0
             then do
-                let frame = head frames
-                    locals = vfLocals frame
+                -- Current frame's locals
+                locals <- readIORef (vmLocals vm)
                 if offset < length locals
                     then do
                         val <- readIORef (locals !! offset)
                         vmPush vm val
                     else vmPush vm Void
-            else if depth > 0 && depth <= length frames
-                then do
-                    let frame = frames !! (depth - 1)
-                        locals = vfLocals frame
-                    if offset < length locals
-                        then do
-                            val <- readIORef (locals !! offset)
-                            vmPush vm val
-                        else vmPush vm Void
-                else vmPush vm Void
+            else do
+                -- Enclosing frame's locals (on call stack)
+                frames <- readIORef (vmFrames vm)
+                if depth <= length frames
+                    then do
+                        let frame = frames !! (depth - 1)
+                            locals = vfLocals frame
+                        if offset < length locals
+                            then do
+                                val <- readIORef (locals !! offset)
+                                vmPush vm val
+                            else vmPush vm Void
+                    else vmPush vm Void
         return Nothing
 
     OP_SET depth offset -> do
         val <- vmPop vm
-        frames <- readIORef (vmFrames vm)
-        if depth == 0 && not (null frames)
+        if depth == 0
             then do
-                let frame = head frames
-                    locals = vfLocals frame
+                -- Current frame's locals
+                locals <- readIORef (vmLocals vm)
                 when (offset < length locals) $
                     writeIORef (locals !! offset) val
-            else when (depth > 0 && depth <= length frames) $ do
-                let frame = frames !! (depth - 1)
-                    locals = vfLocals frame
-                when (offset < length locals) $
-                    writeIORef (locals !! offset) val
+            else do
+                -- Enclosing frame's locals
+                frames <- readIORef (vmFrames vm)
+                when (depth <= length frames) $ do
+                    let frame = frames !! (depth - 1)
+                        locals = vfLocals frame
+                    when (offset < length locals) $
+                        writeIORef (locals !! offset) val
         return Nothing
 
     OP_LOOKUP_GLOBAL idx -> do
@@ -234,6 +260,8 @@ vmStep vm op = case op of
                 writeIORef (vmIP vm) (vfIP frame)
                 -- Restore stack to base pointer
                 writeIORef (vmSP vm) (vfBP frame)
+                -- Restore locals from the return frame
+                writeIORef (vmLocals vm) (vfLocals frame)
                 vmPush vm result
                 return Nothing
 
@@ -383,18 +411,20 @@ callFunc vm func args isTail = case func of
         ip <- readIORef (vmIP vm)
         code <- readIORef (vmCode vm)
         sp <- readIORef (vmSP vm)
+        currentLocals <- readIORef (vmLocals vm)
 
-        -- Create locals from arguments
-        locals <- mapM newIORef args
+        -- Create new locals from arguments
+        newLocals <- mapM newIORef args
 
         unless isTail $ do
-            -- Push current frame
-            let frame = VMFrame code ip sp locals
+            -- Save current frame (with current locals) for return
+            let frame = VMFrame code ip sp currentLocals
             modifyIORef' (vmFrames vm) (frame :)
 
-        -- Switch to new code
+        -- Switch to new code and set new locals
         writeIORef (vmCode vm) childCode
         writeIORef (vmIP vm) 0
+        writeIORef (vmLocals vm) newLocals
 
         return Nothing
 
@@ -414,9 +444,20 @@ callFunc vm func args isTail = case func of
                 vmPush vm val
                 return Nothing
 
-    Func params vararg body closure -> do
-        -- Fall back to interpreter for user-defined functions
-        return $ Just $ VMError $ Default "Non-compiled function in VM"
+    Func _ _ _ funcClosure maybeFid -> do
+        -- Check if this function has been JIT compiled
+        case maybeFid of
+            Just fid -> do
+                maybeCode <- getCompiledCode fid
+                case maybeCode of
+                    Just code ->
+                        -- Use the cached compiled code
+                        callFunc vm (CompiledFunc code funcClosure) args isTail
+                    Nothing ->
+                        -- Not compiled yet, can't handle in VM
+                        return $ Just $ VMError $ Default "Non-compiled function in VM"
+            Nothing ->
+                return $ Just $ VMError $ Default "Non-compiled function in VM"
 
     _ -> return $ Just $ VMError $ NotFunction "Not a function" (show func)
 

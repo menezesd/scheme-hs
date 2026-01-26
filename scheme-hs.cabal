@@ -30,6 +30,7 @@ executable scheme-hs
                     , Bytecode
                     , Compile
                     , VM
+                    , JIT
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -66,6 +67,7 @@ test-suite scheme-hs-test
                     , Bytecode
                     , Compile
                     , VM
+                    , JIT
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -100,6 +102,7 @@ benchmark scheme-hs-bench
                     , Bytecode
                     , Compile
                     , VM
+                    , JIT
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2

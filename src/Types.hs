@@ -274,6 +274,7 @@ data LispVal
            , vararg  :: Maybe String
            , body    :: [LispVal]
            , closure :: Env
+           , funcId  :: Maybe Int       -- JIT call tracking ID
            }
     | CompiledFunc CodeObject Env    -- Bytecode-compiled function
     | Macro { macroParams  :: [String]
@@ -334,7 +335,7 @@ showVal (RandomSourceVal _)  = "<random-source>"
 showVal (RecordInstance rt _) = "#<" ++ rtName rt ++ ">"
 showVal EOF               = "#<eof>"
 showVal (Cont _)          = "<continuation>"
-showVal (Func args vararg' _ _) =
+showVal (Func args vararg' _ _ _) =
     "(lambda (" ++ unwords args ++
     (case vararg' of
         Nothing  -> ""

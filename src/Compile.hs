@@ -20,6 +20,7 @@ module Compile
     ( -- * Compilation
       compile
     , compileTopLevel
+    , compileLambda
       -- * Compiler state
     , CompileState
     ) where

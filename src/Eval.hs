@@ -46,13 +46,37 @@ import Types
 import Env
 import Parser (readExpr, readExprList)
 import Primitives (eqv)
+import VM (runVMWithArgs, vmInit, VMResult(..))
+import Compile (compileLambda)
+import Bytecode (CodeObject)
+import JIT (jitThreshold, incrementCallCount, newFuncId, getCompiledCode, cacheCompiledCode)
+import DeBruijn (emptyLexEnv, extendLexEnv)
 import Control.Monad (unless, forM)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
 import Control.Exception (bracket, try, IOException)
 import Data.Maybe (isNothing)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import System.IO (IOMode(..), openFile, hClose)
+import System.IO.Unsafe (unsafePerformIO)
+-- | Try to JIT compile a function, returning CodeObject if successful
+tryJITCompile :: [String] -> Maybe String -> [LispVal] -> IO (Maybe CodeObject)
+tryJITCompile params vararg body = do
+    let allParams = case vararg of
+            Nothing -> params
+            Just v  -> params ++ [v]
+        hasRest = case vararg of
+            Nothing -> False
+            Just _  -> True
+        lexEnv = extendLexEnv allParams emptyLexEnv
+    -- Try to compile just the body (not the whole lambda)
+    case compileLambda lexEnv allParams hasRest body of
+        Left _ -> return Nothing  -- Compilation failed, keep interpreting
+        Right code -> return $ Just code
+
+-- ============================================================================
+-- Tail Call Optimization
+-- ============================================================================
 
 -- | Tail call result - used for trampoline-based TCO
 data TailCall
@@ -125,14 +149,26 @@ eval env (List (Atom "and" : args)) = evalAnd env args
 eval env (List (Atom "or" : args)) = evalOr env args
 
 -- Lambda
-eval env (List (Atom "lambda" : List params : body)) =
-    return $ Func (map showVal params) Nothing body env
+eval env (List (Atom "lambda" : List params : body)) = do
+    fid <- liftIO newFuncId
+    return $ Func (map showVal params) Nothing body env (Just fid)
 
-eval env (List (Atom "lambda" : DottedList params vararg : body)) =
-    return $ Func (map showVal params) (Just $ showVal vararg) body env
+eval env (List (Atom "lambda" : DottedList params vararg : body)) = do
+    fid <- liftIO newFuncId
+    return $ Func (map showVal params) (Just $ showVal vararg) body env (Just fid)
 
-eval env (List (Atom "lambda" : vararg@(Atom _) : body)) =
-    return $ Func [] (Just $ showVal vararg) body env
+eval env (List (Atom "lambda" : vararg@(Atom _) : body)) = do
+    fid <- liftIO newFuncId
+    return $ Func [] (Just $ showVal vararg) body env (Just fid)
+
+-- Compiled lambda - compile to bytecode immediately
+eval env (List (Atom "compiled-lambda" : List params : body)) = do
+    let paramNames = map showVal params
+        -- Extend lexical environment with parameters
+        lexEnv = extendLexEnv paramNames emptyLexEnv
+    case compileLambda lexEnv paramNames False body of
+        Left err -> throwError err
+        Right code -> return $ CompiledFunc code env
 
 -- Define variable
 eval env (List [Atom "define", Atom var, form]) = do
@@ -141,11 +177,13 @@ eval env (List [Atom "define", Atom var, form]) = do
 
 -- Define function (shorthand)
 eval env (List (Atom "define" : List (Atom var : params) : body)) = do
-    let func = Func (map showVal params) Nothing body env
+    fid <- liftIO newFuncId
+    let func = Func (map showVal params) Nothing body env (Just fid)
     defineVar env var func
 
 eval env (List (Atom "define" : DottedList (Atom var : params) vararg : body)) = do
-    let func = Func (map showVal params) (Just $ showVal vararg) body env
+    fid <- liftIO newFuncId
+    let func = Func (map showVal params) (Just $ showVal vararg) body env (Just fid)
     defineVar env var func
 
 -- Set!
@@ -166,7 +204,8 @@ eval env (List (Atom "let" : Atom name : List bindings : body)) = do
     -- Create environment first with placeholder for the function
     newEnv <- liftIO $ extendEnv env ((name, Void) : bindingPairs)
     -- Create function with the new environment as its closure (so it can call itself)
-    let func = Func paramNames Nothing body newEnv
+    fid <- liftIO newFuncId
+    let func = Func paramNames Nothing body newEnv (Just fid)
     -- Update the binding to the actual function
     _ <- setVar newEnv name func
     evalBody newEnv body
@@ -194,8 +233,9 @@ eval env (List (Atom "do" : List bindings : List (test : exprs) : commands)) =
     evalDo env bindings test exprs commands
 
 -- Delay (for lazy evaluation)
-eval env (List [Atom "delay", expr]) =
-    return $ Func [] Nothing [expr] env
+eval env (List [Atom "delay", expr]) = do
+    fid <- liftIO newFuncId
+    return $ Func [] Nothing [expr] env (Just fid)
 
 -- Define-syntax
 eval env (List [Atom "define-syntax", Atom keyword, transformer]) = do
@@ -435,17 +475,54 @@ applyTail _ (PrimitiveFunc func) args = Done <$> liftThrows (func args)
 applyTail _ (IOFunc func) args = Done <$> func args
 applyTail _ (Cont (Continuation k)) [arg] = Done <$> k arg
 applyTail _ (Cont _) args = throwError $ NumArgs 1 args
-applyTail _ (Func params vararg body closure) args
+applyTail _ (Func params vararg body closure maybeFid) args
     | length params /= length args && isNothing vararg =
         throwError $ NumArgs (toInteger $ length params) args
     | otherwise = do
-        let remainingArgs = drop (length params) args
-        let bindings = zip params args
-        let varargBinding = case vararg of
-                Nothing  -> []
-                Just arg -> [(arg, List remainingArgs)]
-        newEnv <- liftIO $ extendEnv closure (bindings ++ varargBinding)
-        evalBodyTail newEnv body
+        -- Get or create function ID for JIT tracking
+        fid <- case maybeFid of
+            Just id' -> return id'
+            Nothing -> liftIO newFuncId
+
+        -- Check if already compiled
+        cachedCode <- liftIO $ getCompiledCode fid
+        case cachedCode of
+            Just code -> runCompiled code  -- Use cached compiled version
+            Nothing -> do
+                -- Not compiled yet, check if we should compile
+                shouldCompile <- liftIO $ incrementCallCount fid
+                if shouldCompile
+                    then do
+                        maybeCode <- liftIO $ tryJITCompile params vararg body
+                        case maybeCode of
+                            Just code -> do
+                                liftIO $ cacheCompiledCode fid code  -- Cache it
+                                runCompiled code  -- Use compiled version
+                            Nothing -> interpretFunc  -- Compilation failed
+                    else interpretFunc
+      where
+        runCompiled code = do
+            vm <- liftIO $ vmInit closure
+            result <- liftIO $ runVMWithArgs vm code args
+            case result of
+                VMDone val -> return $ Done val
+                VMError err -> throwError err
+
+        interpretFunc = do
+            let remainingArgs = drop (length params) args
+            let bindings = zip params args
+            let varargBinding = case vararg of
+                    Nothing  -> []
+                    Just arg -> [(arg, List remainingArgs)]
+            newEnv <- liftIO $ extendEnv closure (bindings ++ varargBinding)
+            evalBodyTail newEnv body
+-- Compiled function: run via bytecode VM
+applyTail _ (CompiledFunc code closure) args = do
+    vm <- liftIO $ vmInit closure
+    result <- liftIO $ runVMWithArgs vm code args
+    case result of
+        VMDone val -> return $ Done val
+        VMError err -> throwError err
 applyTail _ notFunc _ = throwError $ NotFunction "Not a function" (show notFunc)
 
 -- | Evaluate body with tail call support (last expr is tail position)
@@ -511,7 +588,8 @@ evalTail env (List (Atom "let" : Atom name : List bindings : body)) = do
     bindingPairs <- mapM (extractBinding env) bindings
     let paramNames = map fst bindingPairs
     newEnv <- liftIO $ extendEnv env ((name, Void) : bindingPairs)
-    let func = Func paramNames Nothing body newEnv
+    fid <- liftIO newFuncId
+    let func = Func paramNames Nothing body newEnv (Just fid)
     _ <- setVar newEnv name func
     evalBodyTail newEnv body
 
