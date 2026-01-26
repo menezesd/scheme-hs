@@ -147,6 +147,14 @@ numericPrimitives =
     , ("atan", atanNum)
     , ("sqrt", sqrtNum)
 
+    -- Hyperbolic functions
+    , ("sinh", unaryTranscendental sinh)
+    , ("cosh", unaryTranscendental cosh)
+    , ("tanh", unaryTranscendental tanh)
+    , ("asinh", unaryTranscendental asinh)
+    , ("acosh", unaryTranscendental acosh)
+    , ("atanh", unaryTranscendental atanh)
+
     -- Complex number operations
     , ("make-rectangular", makeRectangular)
     , ("make-polar", makePolar')

@@ -38,6 +38,7 @@ executable scheme-hs
                     , random >= 1.2
                     , vector >= 0.12
                     , deepseq >= 1.4
+                    , time >= 1.9
     hs-source-dirs:   src
     default-language: Haskell2010
 
@@ -75,6 +76,7 @@ test-suite scheme-hs-test
                     , random >= 1.2
                     , vector >= 0.12
                     , deepseq >= 1.4
+                    , time >= 1.9
     hs-source-dirs:   test, src
     default-language: Haskell2010
 

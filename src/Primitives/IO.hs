@@ -63,15 +63,21 @@ module Primitives.IO
       -- * Transcript (no-ops)
     , transcriptOn
     , transcriptOff
+      -- * System utilities
+    , gensym
+    , currentSecond
+    , exitProc
     ) where
 
 import Types
 import Parser (readExpr, readExprList)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import System.IO
+import System.IO.Unsafe (unsafePerformIO)
 import Control.Exception (try, IOException)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 
 -- | All I/O primitive functions
 ioPrimitives :: [(String, [LispVal] -> IOThrowsError LispVal)]
@@ -120,6 +126,10 @@ ioPrimitives =
     -- Transcript (no-ops - optional in R5RS)
     , ("transcript-on", transcriptOn)
     , ("transcript-off", transcriptOff)
+    -- System utilities
+    , ("gensym", gensym)
+    , ("current-second", currentSecond)
+    , ("exit", exitProc)
     ]
 
 -- | Display a value (without quotes for strings)
@@ -458,3 +468,36 @@ transcriptOn badArgs = throwError $ NumArgs 1 badArgs
 transcriptOff :: [LispVal] -> IOThrowsError LispVal
 transcriptOff [] = return Void
 transcriptOff badArgs = throwError $ NumArgs 0 badArgs
+
+-- | Global counter for gensym
+{-# NOINLINE gensymCounter #-}
+gensymCounter :: IORef Integer
+gensymCounter = unsafePerformIO $ newIORef 0
+
+-- | Generate a unique symbol
+gensym :: [LispVal] -> IOThrowsError LispVal
+gensym [] = do
+    n <- liftIO $ readIORef gensymCounter
+    liftIO $ writeIORef gensymCounter (n + 1)
+    return $ Atom $ "g" ++ show n
+gensym [String prefix] = do
+    n <- liftIO $ readIORef gensymCounter
+    liftIO $ writeIORef gensymCounter (n + 1)
+    return $ Atom $ prefix ++ show n
+gensym [badArg] = throwError $ TypeMismatch "string" badArg
+gensym badArgs = throwError $ NumArgs 1 badArgs
+
+-- | Get current time in seconds since Unix epoch (with fractional part)
+currentSecond :: [LispVal] -> IOThrowsError LispVal
+currentSecond [] = do
+    t <- liftIO getPOSIXTime
+    return $ Number $ SReal $ realToFrac t
+currentSecond badArgs = throwError $ NumArgs 0 badArgs
+
+-- | Exit the interpreter
+exitProc :: [LispVal] -> IOThrowsError LispVal
+exitProc [] = throwError $ Default "exit"
+exitProc [Number (SInteger 0)] = throwError $ Default "exit"
+exitProc [Number (SInteger n)] = throwError $ Default $ "exit: " ++ show n
+exitProc [badArg] = throwError $ TypeMismatch "integer" badArg
+exitProc badArgs = throwError $ NumArgs 1 badArgs
