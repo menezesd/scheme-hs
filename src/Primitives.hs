@@ -54,6 +54,7 @@ import Primitives.List
 import Primitives.Vector
 import Primitives.IO hiding (ioPrimitives)
 import qualified Primitives.IO as PIO
+import qualified Primitives.Random as PRandom
 
 -- | Create environment with all primitives bound
 --
@@ -240,5 +241,6 @@ valuesProc vals = return $ DottedList [Atom "#values"] (List vals)
 -- | All I/O primitive functions
 --
 -- These primitives perform I/O operations and must run in the 'IOThrowsError' monad.
+-- Includes I/O primitives and SRFI-27 random number generation.
 ioPrimitives :: [(String, [LispVal] -> IOThrowsError LispVal)]
-ioPrimitives = PIO.ioPrimitives
+ioPrimitives = PIO.ioPrimitives ++ PRandom.randomPrimitives

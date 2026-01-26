@@ -25,11 +25,19 @@ executable scheme-hs
                     , Primitives.List
                     , Primitives.Vector
                     , Primitives.IO
+                    , Primitives.Random
+                    , DeBruijn
+                    , Bytecode
+                    , Compile
+                    , VM
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
                     , containers >= 0.6
                     , array >= 0.5
+                    , random >= 1.2
+                    , vector >= 0.12
+                    , deepseq >= 1.4
     hs-source-dirs:   src
     default-language: Haskell2010
 
@@ -52,6 +60,11 @@ test-suite scheme-hs-test
                     , Primitives.List
                     , Primitives.Vector
                     , Primitives.IO
+                    , Primitives.Random
+                    , DeBruijn
+                    , Bytecode
+                    , Compile
+                    , VM
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -59,6 +72,9 @@ test-suite scheme-hs-test
                     , array >= 0.5
                     , hspec >= 2.7
                     , QuickCheck >= 2.14
+                    , random >= 1.2
+                    , vector >= 0.12
+                    , deepseq >= 1.4
     hs-source-dirs:   test, src
     default-language: Haskell2010
 
@@ -77,6 +93,11 @@ benchmark scheme-hs-bench
                     , Primitives.List
                     , Primitives.Vector
                     , Primitives.IO
+                    , Primitives.Random
+                    , DeBruijn
+                    , Bytecode
+                    , Compile
+                    , VM
     build-depends:    base >= 4.14 && < 5
                     , parsec >= 3.1
                     , mtl >= 2.2
@@ -84,5 +105,7 @@ benchmark scheme-hs-bench
                     , array >= 0.5
                     , criterion >= 1.5
                     , deepseq >= 1.4
+                    , random >= 1.2
+                    , vector >= 0.12
     hs-source-dirs:   bench, src
     default-language: Haskell2010

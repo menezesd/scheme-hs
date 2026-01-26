@@ -32,6 +32,11 @@ module Primitives.IO
     , closePort
     , currentInputPort
     , currentOutputPort
+      -- * String port operations
+    , openOutputString
+    , getOutputString
+    , openInputString
+    , isStringPort
       -- * Character I/O
     , readChar
     , peekChar
@@ -64,7 +69,7 @@ import Types
 import Parser (readExpr, readExprList)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import System.IO
 import Control.Exception (try, IOException)
 
@@ -83,6 +88,11 @@ ioPrimitives =
     , ("close-output-port", closePort)
     , ("current-input-port", currentInputPort)
     , ("current-output-port", currentOutputPort)
+    -- String port operations
+    , ("open-output-string", openOutputString)
+    , ("get-output-string", getOutputString)
+    , ("open-input-string", openInputString)
+    , ("string-port?", isStringPort)
     -- Character I/O
     , ("read-char", readChar)
     , ("peek-char", peekChar)
@@ -117,6 +127,12 @@ displayProc :: [LispVal] -> IOThrowsError LispVal
 displayProc [val] = displayProc [val, Port stdout]
 displayProc [String s, Port h] = liftIO (hPutStr h s) >> return Void
 displayProc [val, Port h] = liftIO (hPutStr h $ showValForDisplay val) >> return Void
+displayProc [String s, StringOutputPort sp] = do
+    liftIO $ modifyIORef' (spBuffer sp) (++ s)
+    return Void
+displayProc [val, StringOutputPort sp] = do
+    liftIO $ modifyIORef' (spBuffer sp) (++ showValForDisplay val)
+    return Void
 displayProc [_, badArg] = throwError $ TypeMismatch "port" badArg
 displayProc badArgs = throwError $ NumArgs 1 badArgs
 
@@ -129,6 +145,9 @@ showValForDisplay v = show v
 newlineProc :: [LispVal] -> IOThrowsError LispVal
 newlineProc [] = newlineProc [Port stdout]
 newlineProc [Port h] = liftIO (hPutStr h "\n") >> return Void
+newlineProc [StringOutputPort sp] = do
+    liftIO $ modifyIORef' (spBuffer sp) (++ "\n")
+    return Void
 newlineProc [badArg] = throwError $ TypeMismatch "port" badArg
 newlineProc badArgs = throwError $ NumArgs 0 badArgs
 
@@ -136,6 +155,9 @@ newlineProc badArgs = throwError $ NumArgs 0 badArgs
 writeProc :: [LispVal] -> IOThrowsError LispVal
 writeProc [val] = writeProc [val, Port stdout]
 writeProc [val, Port h] = liftIO (hPutStr h $ show val) >> return Void
+writeProc [val, StringOutputPort sp] = do
+    liftIO $ modifyIORef' (spBuffer sp) (++ show val)
+    return Void
 writeProc [_, badArg] = throwError $ TypeMismatch "port" badArg
 writeProc badArgs = throwError $ NumArgs 1 badArgs
 
@@ -149,6 +171,18 @@ readProc [Port h] = do
         else do
             input <- liftIO $ hGetLine h
             liftThrows $ readExpr input
+readProc [StringInputPort sp] = do
+    buf <- liftIO $ readIORef (spBuffer sp)
+    pos <- liftIO $ readIORef (spPosition sp)
+    let remaining = drop pos buf
+    if null remaining
+        then return EOF
+        else do
+            -- Read up to newline or end of buffer
+            let (line, rest) = break (== '\n') remaining
+            let newPos = pos + length line + (if null rest then 0 else 1)
+            liftIO $ writeIORef (spPosition sp) newPos
+            liftThrows $ readExpr line
 readProc [badArg] = throwError $ TypeMismatch "port" badArg
 readProc badArgs = throwError $ NumArgs 0 badArgs
 
@@ -168,11 +202,13 @@ isPort _ = return $ Bool False
 -- | Check if value is an input port
 isInputPort :: LispVal -> ThrowsError LispVal
 isInputPort (Port _) = return $ Bool True
+isInputPort (StringInputPort _) = return $ Bool True
 isInputPort _ = return $ Bool False
 
 -- | Check if value is an output port
 isOutputPort :: LispVal -> ThrowsError LispVal
 isOutputPort (Port _) = return $ Bool True
+isOutputPort (StringOutputPort _) = return $ Bool True
 isOutputPort _ = return $ Bool False
 
 -- | Check if value is the EOF object
@@ -203,6 +239,8 @@ openOutputFile badArgs = throwError $ NumArgs 1 badArgs
 -- | Close a port
 closePort :: [LispVal] -> IOThrowsError LispVal
 closePort [Port h] = liftIO (hClose h) >> return Void
+closePort [StringInputPort _] = return Void  -- String ports don't need closing
+closePort [StringOutputPort _] = return Void
 closePort [badArg] = throwError $ TypeMismatch "port" badArg
 closePort badArgs = throwError $ NumArgs 1 badArgs
 
@@ -216,6 +254,38 @@ currentOutputPort :: [LispVal] -> IOThrowsError LispVal
 currentOutputPort [] = return $ Port stdout
 currentOutputPort badArgs = throwError $ NumArgs 0 badArgs
 
+-- | Create a new string output port
+openOutputString :: [LispVal] -> IOThrowsError LispVal
+openOutputString [] = do
+    bufRef <- liftIO $ newIORef ""
+    posRef <- liftIO $ newIORef 0
+    return $ StringOutputPort $ StringPort bufRef posRef
+openOutputString badArgs = throwError $ NumArgs 0 badArgs
+
+-- | Get the accumulated string from a string output port
+getOutputString :: [LispVal] -> IOThrowsError LispVal
+getOutputString [StringOutputPort sp] = do
+    buf <- liftIO $ readIORef (spBuffer sp)
+    return $ String buf
+getOutputString [badArg] = throwError $ TypeMismatch "string-output-port" badArg
+getOutputString badArgs = throwError $ NumArgs 1 badArgs
+
+-- | Create a new string input port from a string
+openInputString :: [LispVal] -> IOThrowsError LispVal
+openInputString [String s] = do
+    bufRef <- liftIO $ newIORef s
+    posRef <- liftIO $ newIORef 0
+    return $ StringInputPort $ StringPort bufRef posRef
+openInputString [badArg] = throwError $ TypeMismatch "string" badArg
+openInputString badArgs = throwError $ NumArgs 1 badArgs
+
+-- | Check if a value is a string port
+isStringPort :: [LispVal] -> IOThrowsError LispVal
+isStringPort [StringInputPort _] = return $ Bool True
+isStringPort [StringOutputPort _] = return $ Bool True
+isStringPort [_] = return $ Bool False
+isStringPort badArgs = throwError $ NumArgs 1 badArgs
+
 -- | Read a single character
 readChar :: [LispVal] -> IOThrowsError LispVal
 readChar [] = readChar [Port stdin]
@@ -226,6 +296,14 @@ readChar [Port h] = do
         else do
             c <- liftIO $ hGetChar h
             return $ Char c
+readChar [StringInputPort sp] = do
+    buf <- liftIO $ readIORef (spBuffer sp)
+    pos <- liftIO $ readIORef (spPosition sp)
+    if pos >= length buf
+        then return EOF
+        else do
+            liftIO $ writeIORef (spPosition sp) (pos + 1)
+            return $ Char (buf !! pos)
 readChar [badArg] = throwError $ TypeMismatch "port" badArg
 readChar badArgs = throwError $ NumArgs 1 badArgs
 
@@ -239,6 +317,12 @@ peekChar [Port h] = do
         else do
             c <- liftIO $ hLookAhead h
             return $ Char c
+peekChar [StringInputPort sp] = do
+    buf <- liftIO $ readIORef (spBuffer sp)
+    pos <- liftIO $ readIORef (spPosition sp)
+    if pos >= length buf
+        then return EOF
+        else return $ Char (buf !! pos)
 peekChar [badArg] = throwError $ TypeMismatch "port" badArg
 peekChar badArgs = throwError $ NumArgs 1 badArgs
 
@@ -246,6 +330,9 @@ peekChar badArgs = throwError $ NumArgs 1 badArgs
 writeChar :: [LispVal] -> IOThrowsError LispVal
 writeChar [Char c] = writeChar [Char c, Port stdout]
 writeChar [Char c, Port h] = liftIO (hPutChar h c) >> return Void
+writeChar [Char c, StringOutputPort sp] = do
+    liftIO $ modifyIORef' (spBuffer sp) (++ [c])
+    return Void
 writeChar [Char _, badArg] = throwError $ TypeMismatch "port" badArg
 writeChar [badArg, _] = throwError $ TypeMismatch "char" badArg
 writeChar badArgs = throwError $ NumArgs 1 badArgs
@@ -256,6 +343,10 @@ charReady [] = charReady [Port stdin]
 charReady [Port h] = do
     ready <- liftIO $ hReady h
     return $ Bool ready
+charReady [StringInputPort sp] = do
+    buf <- liftIO $ readIORef (spBuffer sp)
+    pos <- liftIO $ readIORef (spPosition sp)
+    return $ Bool (pos < length buf)
 charReady [badArg] = throwError $ TypeMismatch "port" badArg
 charReady badArgs = throwError $ NumArgs 1 badArgs
 

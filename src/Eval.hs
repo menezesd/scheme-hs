@@ -46,11 +46,12 @@ import Types
 import Env
 import Parser (readExpr, readExprList)
 import Primitives (eqv)
-import Control.Monad (unless)
+import Control.Monad (unless, forM)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
 import Control.Exception (bracket, try, IOException)
 import Data.Maybe (isNothing)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import System.IO (IOMode(..), openFile, hClose)
 
 -- | Tail call result - used for trampoline-based TCO
@@ -226,6 +227,113 @@ eval env (List (Atom "letrec-syntax" : List bindings : body)) = do
         _ <- setVar env' name syntax
         return ()
     evalSyntaxBinding _ badForm = throwError $ BadSpecialForm "Invalid syntax binding" badForm
+
+-- SRFI-9: define-record-type
+-- (define-record-type <name>
+--   (<constructor> <field-tag> ...)
+--   <predicate>
+--   (<field-tag> <accessor> [<modifier>]) ...)
+eval env (List (Atom "define-record-type" : Atom typeName : constructor : predicate : fieldSpecs)) = do
+    -- Parse constructor: (<name> <field-tag> ...)
+    (ctorName, ctorFields) <- case constructor of
+        List (Atom name : fields) -> do
+            fieldNames <- mapM extractFieldTag fields
+            return (name, fieldNames)
+        _ -> throwError $ BadSpecialForm "Invalid constructor in define-record-type" constructor
+
+    -- Parse predicate
+    predName <- case predicate of
+        Atom name -> return name
+        _ -> throwError $ BadSpecialForm "Invalid predicate in define-record-type" predicate
+
+    -- Parse field specs: (<field-tag> <accessor> [<modifier>]) ...
+    (allFields, accessors, mutators) <- parseFieldSpecs fieldSpecs
+
+    -- Verify constructor fields match field specs
+    let missingFields = filter (`notElem` allFields) ctorFields
+    unless (null missingFields) $
+        throwError $ Default $ "Constructor references undefined fields: " ++ unwords missingFields
+
+    -- Create the record type
+    let fieldIndices = zip allFields [0..]
+        accessorPairs = [(acc, idx) | (field, acc, _) <- accessors, Just idx <- [lookup field fieldIndices]]
+        mutatorPairs = [(mut, idx) | (field, _, Just mut) <- accessors, Just idx <- [lookup field fieldIndices]]
+        rt = RecordType
+            { rtName = typeName
+            , rtFields = allFields
+            , rtConstructor = ctorName
+            , rtPredicate = predName
+            , rtAccessors = accessorPairs
+            , rtMutators = mutatorPairs
+            }
+
+    -- Define constructor
+    let ctorFieldIndices = [idx | f <- ctorFields, Just idx <- [lookup f fieldIndices]]
+        ctorFunc = IOFunc $ \args -> do
+            if length args /= length ctorFields
+                then throwError $ NumArgs (toInteger $ length ctorFields) args
+                else do
+                    -- Create field array, initializing with Void for non-constructor fields
+                    refs <- liftIO $ forM allFields $ \_ -> newIORef Void
+                    -- Fill in constructor fields
+                    liftIO $ mapM_ (\(idx, val) -> writeIORef (refs !! idx) val) (zip ctorFieldIndices args)
+                    return $ RecordInstance rt refs
+
+    _ <- defineVar env ctorName ctorFunc
+
+    -- Define predicate
+    let predFunc = PrimitiveFunc $ \args -> case args of
+            [RecordInstance rt' _] -> return $ Bool (rtName rt' == typeName)
+            [_] -> return $ Bool False
+            _ -> throwError $ NumArgs 1 args
+
+    _ <- defineVar env predName predFunc
+
+    -- Define accessors
+    mapM_ (defineAccessor env typeName) accessorPairs
+
+    -- Define mutators
+    mapM_ (defineMutator env typeName) mutatorPairs
+
+    return Void
+
+  where
+    extractFieldTag (Atom name) = return name
+    extractFieldTag badForm = throwError $ BadSpecialForm "Expected field tag" badForm
+
+    parseFieldSpecs specs = do
+        results <- mapM parseFieldSpec specs
+        let fields = map (\(f, _, _) -> f) results
+        return (fields, results, [(f, m) | (f, _, Just m) <- results])
+
+    parseFieldSpec (List [Atom field, Atom accessor]) =
+        return (field, accessor, Nothing)
+    parseFieldSpec (List [Atom field, Atom accessor, Atom mutator]) =
+        return (field, accessor, Just mutator)
+    parseFieldSpec badForm =
+        throwError $ BadSpecialForm "Invalid field spec in define-record-type" badForm
+
+    defineAccessor env' typeName' (accName, idx) = do
+        let accFunc = IOFunc $ \args -> case args of
+                [RecordInstance rt' refs] ->
+                    if rtName rt' == typeName'
+                        then liftIO $ readIORef (refs !! idx)
+                        else throwError $ TypeMismatch typeName' (RecordInstance rt' refs)
+                [badArg] -> throwError $ TypeMismatch typeName' badArg
+                _ -> throwError $ NumArgs 1 args
+        defineVar env' accName accFunc
+
+    defineMutator env' typeName' (mutName, idx) = do
+        let mutFunc = IOFunc $ \args -> case args of
+                [RecordInstance rt' refs, val] ->
+                    if rtName rt' == typeName'
+                        then do
+                            liftIO $ writeIORef (refs !! idx) val
+                            return Void
+                        else throwError $ TypeMismatch typeName' (RecordInstance rt' refs)
+                [badArg, _] -> throwError $ TypeMismatch typeName' badArg
+                _ -> throwError $ NumArgs 2 args
+        defineVar env' mutName mutFunc
 
 -- Apply
 eval env (List [Atom "apply", func, arg]) = do

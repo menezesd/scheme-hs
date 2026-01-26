@@ -63,6 +63,20 @@ module Types
     , noSource
     , showSourceInfo
     , fromSourcePos
+    -- String ports
+    , StringPort(..)
+    , PortDirection(..)
+    -- Random source
+    , RandomSource(..)
+    -- Records (SRFI-9)
+    , RecordType(..)
+    -- De Bruijn indices
+    , LexicalAddress(..)
+    -- Bytecode
+    , CodeObject(..)
+    -- Numeric optimizations
+    , mkInteger
+    , mkNumber
     -- Error helpers
     , throwNumArgs
     , throwTypeMismatch
@@ -80,6 +94,35 @@ import Data.Complex (Complex(..), realPart, imagPart)
 import Data.Map.Strict (Map)
 import System.IO (Handle)
 import System.IO.Unsafe (unsafePerformIO)
+import Data.Word (Word64)
+import qualified Data.Vector as V
+
+import Bytecode (CodeObject(..))
+
+-- | String port for in-memory I/O
+data StringPort = StringPort
+    { spBuffer   :: IORef String  -- Accumulated output or remaining input
+    , spPosition :: IORef Int     -- Current position (for input ports)
+    }
+
+-- | Port direction
+data PortDirection = PortInput | PortOutput
+    deriving (Eq, Show)
+
+-- | Random source state (xoshiro256**)
+data RandomSource = RandomSource
+    { rsState :: IORef (Word64, Word64, Word64, Word64)
+    }
+
+-- | SRFI-9 Record type definition
+data RecordType = RecordType
+    { rtName        :: String           -- Record type name
+    , rtFields      :: [String]         -- Field names in order
+    , rtConstructor :: String           -- Constructor name
+    , rtPredicate   :: String           -- Predicate name
+    , rtAccessors   :: [(String, Int)]  -- (accessor-name, field-index) pairs
+    , rtMutators    :: [(String, Int)]  -- (mutator-name, field-index) pairs
+    } deriving (Eq, Show)
 
 -- | Source location information for error messages
 data SourceInfo = SourceInfo
@@ -178,12 +221,39 @@ simplifyNum (SRational r)
     | otherwise = SRational r
 simplifyNum n = n
 
+-- | Small integer cache for values 0-255
+-- Uses NOINLINE to ensure the cache is shared across all uses
+{-# NOINLINE smallIntCache #-}
+smallIntCache :: V.Vector LispVal
+smallIntCache = V.fromList [Number (SInteger i) | i <- [0..255]]
+
+-- | Smart constructor for integers - uses cache for small values
+mkInteger :: Integer -> LispVal
+mkInteger n
+    | n >= 0 && n <= 255 = smallIntCache V.! fromIntegral n
+    | otherwise = Number (SInteger n)
+{-# INLINE mkInteger #-}
+
+-- | Smart constructor for numbers - applies simplification and caching
+mkNumber :: SchemeNum -> LispVal
+mkNumber sn = case simplifyNum sn of
+    SInteger n -> mkInteger n
+    simplified -> Number simplified
+{-# INLINE mkNumber #-}
+
 -- | Continuation type for call/cc
 newtype Continuation = Continuation (LispVal -> IOThrowsError LispVal)
+
+-- | Lexical address for De Bruijn indexed variables
+data LexicalAddress = LexicalAddress
+    { laDepth  :: !Int   -- Number of scopes to traverse (0 = current)
+    , laOffset :: !Int   -- Index within that scope
+    } deriving (Eq, Show)
 
 -- | The core Scheme value type
 data LispVal
     = Atom String                          -- Symbols/identifiers
+    | LexicalRef String LexicalAddress     -- Variable with computed address
     | List [LispVal]                       -- Proper lists (immutable)
     | DottedList [LispVal] LispVal         -- Improper lists (a b . c)
     | MutablePair (IORef LispVal) (IORef LispVal)  -- Mutable cons cell for set-car!/set-cdr!
@@ -194,13 +264,18 @@ data LispVal
     | Vector (Array Int LispVal)           -- Vectors
     | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
     | IOFunc ([LispVal] -> IOThrowsError LispVal)
-    | Port Handle                          -- I/O ports
+    | Port Handle                          -- I/O ports (file-based)
+    | StringInputPort StringPort           -- In-memory input port
+    | StringOutputPort StringPort          -- In-memory output port
+    | RandomSourceVal RandomSource         -- SRFI-27 random source
+    | RecordInstance RecordType [IORef LispVal]  -- SRFI-9 record instance
     | EOF                                  -- End-of-file object
     | Func { params  :: [String]
            , vararg  :: Maybe String
            , body    :: [LispVal]
            , closure :: Env
            }
+    | CompiledFunc CodeObject Env    -- Bytecode-compiled function
     | Macro { macroParams  :: [String]
             , macroVararg  :: Maybe String
             , macroBody    :: [LispVal]
@@ -232,6 +307,7 @@ instance Eq LispVal where
 
 showVal :: LispVal -> String
 showVal (Atom name)       = name
+showVal (LexicalRef name _) = name  -- Display as the original name
 showVal (List contents)   = "(" ++ unwordsList contents ++ ")"
 showVal (DottedList h t)  = "(" ++ unwordsList h ++ " . " ++ showVal t ++ ")"
 showVal (MutablePair carRef cdrRef) =
@@ -252,6 +328,10 @@ showVal (Vector arr)      = "#(" ++ unwordsList (elems arr) ++ ")"
 showVal (PrimitiveFunc _) = "<primitive>"
 showVal (IOFunc _)        = "<IO primitive>"
 showVal (Port _)          = "<IO port>"
+showVal (StringInputPort _)  = "<string-input-port>"
+showVal (StringOutputPort _) = "<string-output-port>"
+showVal (RandomSourceVal _)  = "<random-source>"
+showVal (RecordInstance rt _) = "#<" ++ rtName rt ++ ">"
 showVal EOF               = "#<eof>"
 showVal (Cont _)          = "<continuation>"
 showVal (Func args vararg' _ _) =
@@ -259,6 +339,7 @@ showVal (Func args vararg' _ _) =
     (case vararg' of
         Nothing  -> ""
         Just arg -> " . " ++ arg) ++ ") ...)"
+showVal (CompiledFunc _ _) = "<compiled-function>"
 showVal (Macro args vararg' _) =
     "(macro (" ++ unwords args ++
     (case vararg' of
